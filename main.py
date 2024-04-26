@@ -110,7 +110,7 @@ def run_ccdl():
     return result
 
 def run_cohort_query(structured_query):
-    result = requests.post(f"{FLARE_BASE_URL}/execute-cohort", json=structured_query)
+    result = requests.post(f"{FLARE_BASE_URL}/query/execute-cohort", json=structured_query)
     result.raise_for_status()
     patient_ids = result.json()
     return patient_ids
