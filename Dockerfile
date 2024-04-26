@@ -1,4 +1,3 @@
-# Use Docker-in-Docker official image
 FROM docker:dind
 
 # Install Python and pip via apk
@@ -9,17 +8,15 @@ RUN apk add --no-cache python3 py3-pip \
 RUN python3 -m venv /venv
 ENV PATH="/venv/bin:$PATH"
 
+# Install dependencies
+RUN pip install --no-cache --upgrade pip setuptools
+
 # Set up work directory
 WORKDIR /app
 
-# Copy the requirements file
+# Copy the requirements and install them
 COPY requirements.txt .
-
-# Install Python dependencies within the virtual environment using pip
-# Install Gunicorn in addition to other requirements
-RUN pip install --no-cache --upgrade pip setuptools \
-    && pip install --no-cache-dir -r requirements.txt \
-    && pip install gunicorn
+RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy the rest of the application
 COPY . .
@@ -28,6 +25,6 @@ COPY . .
 RUN openssl req -x509 -newkey rsa:4096 -nodes -keyout key.pem -out cert.pem -days 365 \
     -subj "/C=US/ST=State/L=City/O=Organization/CN=localhost"
 
-# Command to run the Flask application with Gunicorn over HTTPS
-# Adjust the number of workers and threads as necessary
+# Start Docker daemon and then your application
+ENTRYPOINT ["dockerd-entrypoint.sh"]
 CMD ["gunicorn", "-w", "4", "-b", "0.0.0.0:8000", "--certfile", "cert.pem", "--keyfile", "key.pem", "main:app"]
