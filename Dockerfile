@@ -24,6 +24,10 @@ RUN pip install --no-cache --upgrade pip setuptools \
 # Copy the rest of the application
 COPY . .
 
-# Command to run the Flask application with Gunicorn
+# Generate a self-signed certificate
+RUN openssl req -x509 -newkey rsa:4096 -nodes -keyout key.pem -out cert.pem -days 365 \
+    -subj "/C=US/ST=State/L=City/O=Organization/CN=localhost"
+
+# Command to run the Flask application with Gunicorn over HTTPS
 # Adjust the number of workers and threads as necessary
-CMD ["gunicorn", "-w", "4", "-b", "0.0.0.0:8000", "main:app"]
+CMD ["gunicorn", "-w", "4", "-b", "0.0.0.0:8000", "--certfile", "cert.pem", "--keyfile", "key.pem", "main:app"]
