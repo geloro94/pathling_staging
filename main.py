@@ -1,7 +1,9 @@
+import time
 import pandas as pd
 import json
 import os
 import subprocess
+import docker
 from collections import defaultdict
 from typing import List, Dict
 from io import StringIO
@@ -16,37 +18,104 @@ app = Flask(__name__)
 
 CORS(app, resources={r"/*": {"origins": "*"}})
 
-FHIR_SERVER_BASE_URL = "https://hapi.fhir.org/baseR4"
-PATHLING_CONTAINER_NAME = "pathling-data-extraction-server-1"
+FHIR_SERVER_BASE_URL = os.environ.get("FHIR_SERVER_BASE_URL", "http://localhost:8082/fhir")
+PATHLING_CONTAINER_NAME = "pathling-server-1"
 PATHLING_BEARER_TOKEN = "f4a41f0d-fb75-45b5-88a7-461d4ad95f11"
 PATHLING_BASE_URL = os.environ.get("PATHLING_BASE_URL", "http://localhost:8093/fhir")
+FLARE_BASE_URL = os.environ.get("FLARE_BASE_URL", "http://localhost:8083")
 STAGING_DIR = "/usr/share/staging"
 
 SUPPORTED_RESOURCE_TYPES = ["Patient", "Observation", "Condition", "Consent", "Procedure", "MedicationAdministration",
                             "MedicationStatement", "Specimen"]
 
-CODE_PARAMETER_BY_RESOURCE_TYPE = {
-    "Observation": "code",
-    "Condition": "code",
-    "Procedure": "code",
-    "MedicationAdministration": "medication.code",
-    "MedicationStatement": "medicine.code",
-    "Specimen": "type"
+
+client = docker.from_env()
+
+
+def start_pathling_service(compose_file_path):
+    # Start services as defined in the docker-compose.yml file
+    subprocess.run(["docker-compose", "-f", compose_file_path, "up", "-d"], check=True)
+    print("Pathling service starting...")
+
+
+    # Wait for the service to become healthy
+    for _ in range(30):  
+        service = client.containers.get(PATHLING_CONTAINER_NAME)
+        health_status = service.attrs['State']['Health']['Status']
+        if health_status == 'healthy':
+            print("Pathling service is healthy.")
+            return
+        elif health_status == 'unhealthy':
+            print("Pathling service has become unhealthy.")
+            break
+        time.sleep(10)  # Wait 10 seconds before the next retry as defined in the interval
+
+    raise RuntimeError("Pathling service did not become healthy within the expected time.")
+
+def stop_and_remove_pathling_service(compose_file_path):
+    subprocess.run(["docker-compose", "-f", compose_file_path, "down", "-v"], check=True)
+    print("Pathling service stopped and removed, including volumes.")
+
+
+status_store = {
+    'current_status': 'Idle'
 }
 
-DATE_PARAMETER_BY_RESOURCE_TYPE = {
-    "Observation": "effective",
-    "Condition": "onset",
-    "Procedure": "performed",
-    "MedicationAdministration": "effective",
-    "MedicationStatement": "effective",
-    "Specimen": "collected"
-}
+def update_status(new_status):
+    status_store['current_status'] = new_status
 
+@app.route('/status')
+def get_status():
+    return jsonify(status_store)
 
-@app.route("/run_extraction", methods=["POST"])
-def run_extraction():
-    view_definitions = json.loads(request.get_data())
+@app.route("/run_ccdl", methods=["POST"])
+def run_ccdl():
+    ccdl = json.loads(request.get_data())
+    structured_query = ccdl.get("sq")
+    view_definitions = ccdl.get("viewDefinitions")
+
+    print("Starting Pathling service...")
+    update_status('Starting Pathling service...')
+
+    try:
+        start_pathling_service("pathling/docker-compose.yml")
+
+        print("Getting patient ids...")
+        update_status('Getting patient ids...')
+
+        patient_ids = run_cohort_query(structured_query)
+
+        print("Staging cohort data...")
+        update_status('Staging cohort data...')
+
+        response, status_code = stage_cohort_data(patient_ids)
+
+        if status_code != 200:
+            return response, status_code
+        
+        print("Running extraction...")
+        update_status('Running extraction...')
+        
+        result = run_extraction(view_definitions)
+
+        print("Done!")
+        update_status('Done!')
+    finally:
+        print("Stopping Pathling service...")
+        update_status('Stopping Pathling service...')
+        stop_and_remove_pathling_service("pathling/docker-compose.yml")
+        subprocess.run(["rm", "-f", "pathling/data/ndjson/*.ndjson"], check=True)
+        update_status('Idle')
+
+    return result
+
+def run_cohort_query(structured_query):
+    result = requests.post(f"{FLARE_BASE_URL}/execute-cohort", json=structured_query)
+    result.raise_for_status()
+    patient_ids = result.json()
+    return patient_ids
+
+def run_extraction(view_definitions):
     merged_data = pd.DataFrame()
     for definition in view_definitions:
         view_definition = ViewDefinition.from_json(json.dumps(definition))
@@ -72,11 +141,7 @@ def run_extraction():
     return response
 
 
-@app.route("/etl_everything", methods=["POST"])
-def etl_everything_endpoint():
-    data = request.get_json()
-    patient_ids = data["patient_ids"]
-
+def stage_cohort_data(patient_ids):
     response_bundle = {
         "resourceType": "Bundle",
         "type": "collection",
@@ -105,62 +170,19 @@ def etl_everything_endpoint():
     return response.json(), response.status_code
 
 
-@app.route("/etl", methods=["POST"])
-def etl_endpoint():
-    data = request.get_json()
+def process_and_import_fhir_bundle(bundle: dict):
+    resources = [entry.get("resource") for entry in bundle["entry"] if entry.get("resource")]
+    if not resources:
+        return jsonify({"error": "No resources found"}), 404
+    # Generate NDJSON files from the FHIR Bundle
+    file_name_by_type = write_ndjson_by_resource_type(resources, "example")
 
-    patient_ids = data["patient_ids"]
-    resource_requests = data["resource_requests"]
+    # Generate the parameters for the $import request
+    parameters = create_parameters(file_name_by_type, STAGING_DIR)
 
-    response_bundle = {
-        "resourceType": "Bundle",
-        "type": "collection",
-        "entry": []
-    }
-
-    for patient_id in patient_ids:
-        for resource_request in resource_requests:
-            resource_type = resource_request["resource_type"]
-            if resource_type not in SUPPORTED_RESOURCE_TYPES:
-                return jsonify({"error": f"Unsupported resource type {resource_type}"}), 400
-
-            search_url = f"{FHIR_SERVER_BASE_URL}/{resource_type}?patient=Patient/{patient_id}"
-
-            if "code" in resource_request:
-                code = resource_request["code"]
-                code_parameter = CODE_PARAMETER_BY_RESOURCE_TYPE[resource_type]
-                search_url += f"&{code_parameter}={code}"
-
-            date_parameter = DATE_PARAMETER_BY_RESOURCE_TYPE.get(resource_type)
-            if "date_start" in resource_request and "date_end" in resource_request:
-                date_start = resource_request.get("date_start")
-                date_end = resource_request.get("date_end")
-                if date_start:
-                    search_url += f"&{date_parameter}=ge{date_start}"
-                if date_end:
-                    search_url += f"&{date_parameter}=le{date_end}"
-
-            if "max_results" in resource_request:
-                max_results = resource_request["max_results"]
-                search_url += f"&_count={max_results}"
-            if resource_type == "Observation":
-                search_url += f"&sort={date_parameter}"
-
-            search_response = requests.get(search_url)
-            search_response.raise_for_status()
-            search_results = search_response.json()
-
-            response_bundle["entry"].extend(search_results.get("entry", []))
-        search_url = f"{FHIR_SERVER_BASE_URL}/Patient/{patient_id}"
-        search_response = requests.get(search_url)
-        if search_response.status_code == 200:
-            search_results = search_response.json()
-            response_bundle["entry"].append({"resource": search_results})
-
-    response = process_and_import_fhir_bundle(response_bundle)
-
-    return response.json(), response.status_code
-
+    # Send the import request to the Pathling server
+    return import_files_to_pathling(parameters, PATHLING_BASE_URL, PATHLING_BEARER_TOKEN)
+    
 
 def write_ndjson_by_resource_type(resources: List[dict], filename: str) -> Dict[str, str]:
     resources_by_type = defaultdict(list)
@@ -184,6 +206,22 @@ def write_ndjson(resources: List[dict], filename: str):
             file.write(json.dumps(resource) + '\n')
 
 
+def import_files_to_pathling(parameters, fhir_endpoint, bearer_token):
+    headers = {
+        "Content-Type": "application/fhir+json",
+        "Accept": "application/fhir+json",
+        "Authorization": f"Bearer {bearer_token}"
+    }
+    response = requests.post(f"{fhir_endpoint}/$import", headers=headers, json=parameters)
+    print(parameters)
+
+    if response.status_code != 200:
+        print(f"Error: {response.status_code}, {response.text}")
+    else:
+        print("Import successful")
+    return response
+
+
 def create_parameters(file_name_by_type: Dict[str, str], staging_dir, mode: str = None) \
         -> Dict[str, List[Dict[str, str]]]:
     parameter_list = []
@@ -204,6 +242,7 @@ def create_parameters(file_name_by_type: Dict[str, str], staging_dir, mode: str 
     return parameters
 
 
+
 def copy_file_to_container(src_file: str, container_name: str, destination_path: str) -> None:
     try:
         subprocess.run(
@@ -214,40 +253,5 @@ def copy_file_to_container(src_file: str, container_name: str, destination_path:
         print(f"Error copying file: {e}")
         raise
 
-
-def import_files_to_pathling(parameters, fhir_endpoint, bearer_token):
-    headers = {
-        "Content-Type": "application/fhir+json",
-        "Accept": "application/fhir+json",
-        "Authorization": f"Bearer {bearer_token}"
-    }
-    response = requests.post(f"{fhir_endpoint}/$import", headers=headers, json=parameters)
-    print(parameters)
-
-    if response.status_code != 200:
-        print(f"Error: {response.status_code}, {response.text}")
-    else:
-        print("Import successful")
-    return response
-
-
-def process_and_import_fhir_bundle(bundle: dict):
-    resources = [entry.get("resource") for entry in bundle["entry"] if entry.get("resource")]
-    if not resources:
-        return jsonify({"error": "No resources found"}), 404
-    # Generate NDJSON files from the FHIR Bundle
-    file_name_by_type = write_ndjson_by_resource_type(resources, "example")
-
-    # Copy the generated files to the Docker container
-    # for resource_type, file_name in file_name_by_type.items():
-    #     copy_file_to_container(file_name, PATHLING_CONTAINER_NAME, STAGING_DIR)
-
-    # Generate the parameters for the $import request
-    parameters = create_parameters(file_name_by_type, STAGING_DIR)
-
-    # Send the import request to the Pathling server
-    return import_files_to_pathling(parameters, PATHLING_BASE_URL, PATHLING_BEARER_TOKEN)
-
-
 if __name__ == "__main__":
-    app.run(debug=True)
+    app.run(debug=True, port=8000)

@@ -103,6 +103,7 @@ class ViewDefinition:
     @classmethod
     def from_json(cls, json_string):
         json_dict = json.loads(json_string)
+        print(json_dict)
         view_definition = cls(resource=json_dict["resource"], resourceType=json_dict["resourceType"],
                               status=json_dict["status"], fhirVersion=json_dict["fhirVersion"],
                               date=json_dict["date"], name=json_dict["name"])
