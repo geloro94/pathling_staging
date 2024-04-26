@@ -16,11 +16,14 @@ WORKDIR /app
 COPY requirements.txt .
 
 # Install Python dependencies within the virtual environment using pip
+# Install Gunicorn in addition to other requirements
 RUN pip install --no-cache --upgrade pip setuptools \
-    && pip install --no-cache-dir -r requirements.txt
+    && pip install --no-cache-dir -r requirements.txt \
+    && pip install gunicorn
 
 # Copy the rest of the application
 COPY . .
 
-# Set the command to run your application
-CMD ["python", "main.py"]
+# Command to run the Flask application with Gunicorn
+# Adjust the number of workers and threads as necessary
+CMD ["gunicorn", "-w", "4", "-b", "0.0.0.0:8000", "main:app"]
