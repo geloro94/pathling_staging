@@ -32,4 +32,4 @@ RUN openssl req -x509 -newkey rsa:4096 -nodes -keyout key.pem -out cert.pem -day
 
 # Command to run the Flask application with Gunicorn over HTTPS
 # Adjust the number of workers and threads as necessary
-CMD ["sh", "-c", "dockerd-entrypoint.sh & while ! docker info > /dev/null 2>&1; do sleep 1; echo 'Waiting for Docker daemon to start...'; done; wait; gunicorn -w 4 -b 0.0.0.0:8000 --certfile cert.pem --keyfile key.pem main:app"]
+CMD ["sh", "-c", "dockerd-entrypoint.sh & while ! docker info > /dev/null 2>&1; do sleep 1; echo 'Waiting for Docker daemon to start...'; done; wait; gunicorn -w 4 -b 0.0.0.0:8000 --certfile cert.pem --keyfile key.pem --timeout 0 main:app"]

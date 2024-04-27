@@ -88,7 +88,6 @@ def run_ccdl():
         print("Staging cohort data...")
         update_status('Staging cohort data...')
 
-        print(requests.get(f"{PATHLING_BASE_URL}/metadata").json())
         response, status_code = stage_cohort_data(patient_ids)
 
         if status_code != 200:
@@ -121,7 +120,7 @@ def run_extraction(view_definitions):
     for definition in view_definitions:
         view_definition = ViewDefinition.from_json(json.dumps(definition))
         print(json.dumps(definition))
-        result = run_view_definition(view_definition, "http://localhost:8093/fhir", 60)
+        result = run_view_definition(view_definition, PATHLING_BASE_URL, 60)
 
         column_names = get_column_names(view_definition)
 
@@ -151,9 +150,10 @@ def stage_cohort_data(patient_ids):
 
     for patient_id in patient_ids:
         # Initialize the search URL for the current patient
-        next_url = f"{FHIR_SERVER_BASE_URL}/Patient/{patient_id}/$everything?_count=1000"
+        next_url = f"{FHIR_SERVER_BASE_URL}/Patient/{patient_id}/$everything?_count=500"
 
         while next_url:
+            print(f"Fetching: {next_url}")
             # Make the request to the FHIR server
             search_response = requests.get(next_url)
             search_response.raise_for_status()
@@ -235,7 +235,6 @@ def create_parameters(file_name_by_type: Dict[str, List[str]], staging_dir, mode
 
 def import_files_to_pathling(parameters, fhir_endpoint, bearer_token):
     print("Importing files to Pathling...")
-    print(requests.get(f"{PATHLING_BASE_URL}/metadata").json())
 
     headers = {
         "Content-Type": "application/fhir+json",
