@@ -150,7 +150,7 @@ def stage_cohort_data(patient_ids):
 
     for patient_id in patient_ids:
         # Initialize the search URL for the current patient
-        next_url = f"{FHIR_SERVER_BASE_URL}/Patient/{patient_id}/$everything?_count=20000"
+        next_url = f"{FHIR_SERVER_BASE_URL}/Patient/{patient_id}/$everything?_count=1000"
 
         while next_url:
             # Make the request to the FHIR server
