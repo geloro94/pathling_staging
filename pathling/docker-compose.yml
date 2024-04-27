@@ -4,7 +4,7 @@ services:
   server:
     image: docker.io/aehrc/pathling:6.4.0@sha256:b523a16910caf03d9faf6e2c9a2de02646541bdcd6888ea68006be9d425b5021
     ports:
-      - "${PATHLING_PORT:-8080}:8080"
+      - "${PATHLING_PORT:-8093}:8080"
       - "8040:4040"
       - "8077:7077"
     environment:

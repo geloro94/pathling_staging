@@ -18,15 +18,15 @@ app = Flask(__name__)
 
 CORS(app, resources={r"/*": {"origins": "*"}})
 
-FHIR_SERVER_BASE_URL = os.environ.get("FHIR_SERVER_BASE_URL", "http://localhost:8082/fhir")
+FHIR_SERVER_BASE_URL = os.environ.get("FHIR_SERVER_BASE_URL", "http://localhost:8081/fhir")
 PATHLING_CONTAINER_NAME = "pathling-server-1"
 PATHLING_BEARER_TOKEN = "f4a41f0d-fb75-45b5-88a7-461d4ad95f11"
 PATHLING_BASE_URL = os.environ.get("PATHLING_BASE_URL", "http://localhost:8093/fhir")
-FLARE_BASE_URL = os.environ.get("FLARE_BASE_URL", "http://localhost:8083")
+FLARE_BASE_URL = os.environ.get("FLARE_BASE_URL", "http://localhost:8084")
 STAGING_DIR = "/usr/share/staging"
 
-SUPPORTED_RESOURCE_TYPES = ["Patient", "Observation", "Condition", "Consent", "Procedure", "MedicationAdministration",
-                            "MedicationStatement", "Specimen"]
+SUPPORTED_RESOURCE_TYPES = ["Patient", "Condition", "Consent", "Procedure", "MedicationAdministration",
+                            "MedicationStatement", "Specimen", "AllergyIntolerance", "Immunization", "Observation"]
 
 
 client = docker.from_env()
@@ -88,6 +88,7 @@ def run_ccdl():
         print("Staging cohort data...")
         update_status('Staging cohort data...')
 
+        print(requests.get(f"{PATHLING_BASE_URL}/metadata").json())
         response, status_code = stage_cohort_data(patient_ids)
 
         if status_code != 200:
@@ -164,6 +165,9 @@ def stage_cohort_data(patient_ids):
             # Check for a 'next' link to continue paging
             next_link = [link for link in search_results.get("link", []) if link.get("relation") == "next"]
             next_url = next_link[0].get("url") if next_link else None
+            if next_url:
+                next_url = f"{FHIR_SERVER_BASE_URL}{next_url.split('/fhir')[-1]}"
+
 
     response = process_and_import_fhir_bundle(response_bundle)
 
@@ -172,6 +176,7 @@ def stage_cohort_data(patient_ids):
 
 def process_and_import_fhir_bundle(bundle: dict):
     resources = [entry.get("resource") for entry in bundle["entry"] if entry.get("resource")]
+    resources = [resource for resource in resources if resource.get("resourceType") in SUPPORTED_RESOURCE_TYPES]
     if not resources:
         return jsonify({"error": "No resources found"}), 404
     # Generate NDJSON files from the FHIR Bundle
@@ -184,21 +189,22 @@ def process_and_import_fhir_bundle(bundle: dict):
     return import_files_to_pathling(parameters, PATHLING_BASE_URL, PATHLING_BEARER_TOKEN)
     
 
-def write_ndjson_by_resource_type(resources: List[dict], filename: str) -> Dict[str, str]:
+def write_ndjson_by_resource_type(resources: List[dict], filename: str, max_chunk_size=3000) -> Dict[str, List[str]]:
+    def chunked(data, size):
+        return (data[i:i + size] for i in range(0, len(data), size))
+
     resources_by_type = defaultdict(list)
     for resource in resources:
-        resource_type = resource['resourceType']
-        print(resource_type)
-        resources_by_type[resource_type].append(resource)
+        resources_by_type[resource['resourceType']].append(resource)
 
-    file_name_by_type = {}
+    file_name_by_type = defaultdict(list)
     for resource_type, type_resources in resources_by_type.items():
-        type_filename = f"{filename}-{resource_type}.ndjson"
-        file_name_by_type[resource_type] = type_filename
-        write_ndjson(type_resources, "pathling/data/ndjson/" + type_filename)
+        for index, chunk in enumerate(chunked(type_resources, max_chunk_size)):
+            type_filename = f"{filename}-{resource_type}-{index+1}.ndjson"
+            file_name_by_type[resource_type].append(type_filename)
+            write_ndjson(chunk, "pathling/data/ndjson/" + type_filename)
 
     return file_name_by_type
-
 
 def write_ndjson(resources: List[dict], filename: str):
     with open(filename, 'w') as file:
@@ -206,13 +212,40 @@ def write_ndjson(resources: List[dict], filename: str):
             file.write(json.dumps(resource) + '\n')
 
 
+def create_parameters(file_name_by_type: Dict[str, List[str]], staging_dir, mode: str = None) -> Dict[str, List[Dict[str, str]]]:
+    parameter_list = []
+
+    for resource_type, type_filenames in file_name_by_type.items():
+        for type_filename in type_filenames:
+            file_url = f"file://{staging_dir}/{type_filename}"
+            source_parts = [
+                {"name": "resourceType", "valueCode": resource_type},
+                {"name": "url", "valueUrl": file_url}
+            ]
+
+            if mode:
+                source_parts.append({"name": "mode", "valueCode": mode})
+
+            parameter_list.append({"name": "source", "part": source_parts})
+
+    parameters = {"resourceType": "Parameters", "parameter": parameter_list}
+    return parameters
+
+
+
 def import_files_to_pathling(parameters, fhir_endpoint, bearer_token):
+    print("Importing files to Pathling...")
+    print(requests.get(f"{PATHLING_BASE_URL}/metadata").json())
+
     headers = {
         "Content-Type": "application/fhir+json",
         "Accept": "application/fhir+json",
         "Authorization": f"Bearer {bearer_token}"
     }
+    print(fhir_endpoint)
+
     response = requests.post(f"{fhir_endpoint}/$import", headers=headers, json=parameters)
+    print(response)
     print(parameters)
 
     if response.status_code != 200:
@@ -220,26 +253,6 @@ def import_files_to_pathling(parameters, fhir_endpoint, bearer_token):
     else:
         print("Import successful")
     return response
-
-
-def create_parameters(file_name_by_type: Dict[str, str], staging_dir, mode: str = None) \
-        -> Dict[str, List[Dict[str, str]]]:
-    parameter_list = []
-
-    for resource_type, type_filename in file_name_by_type.items():
-        file_url = f"file://{staging_dir}/{type_filename}"
-        source_parts = [
-            {"name": "resourceType", "valueCode": resource_type},
-            {"name": "url", "valueUrl": file_url}
-        ]
-
-        if mode:
-            source_parts.append({"name": "mode", "valueCode": mode})
-
-        parameter_list.append({"name": "source", "part": source_parts})
-
-    parameters = {"resourceType": "Parameters", "parameter": parameter_list}
-    return parameters
 
 
 
